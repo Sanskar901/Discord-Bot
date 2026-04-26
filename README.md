@@ -79,7 +79,7 @@ Update the following in `main.py` to match your server:
 ---
 
 ## 🤝 Support & Credits
-Developed by **Antigravity** (AI Coding Assistant) for the **VirelApp** ecosystem.
+Developed by **Sanskar** for the **VirelApp** ecosystem.
 
 > [!TIP]
 > **Pro Tip:** To ensure smooth role assignments, place the Bot's Role at the very top of the Discord Role Hierarchy.
