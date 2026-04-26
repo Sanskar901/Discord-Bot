@@ -313,6 +313,28 @@ SLOTLIST_LOCKS_LOCK = asyncio.Lock()
 WAITLIST_LOCK = asyncio.Lock()
 is_mirroring = False # Lock for sheet sync
 
+# --- SMART SYNC: DIRTY FLAGS ---
+# Per-table flags. The 15s drainer pushes only flagged tables.
+# Start clean — Sheets are only touched when an actual DB write occurs.
+SYNC_DIRTY = {'teams': False, 'logs': False, 'bans': False, 'deleted': False, 'config': False}
+SYNC_DIRTY_LOCK = threading.Lock()
+_drain_running = False  # Re-entrancy guard for the drainer
+
+def _mark_dirty(*tables):
+    """Flags one or more tables for the next sheet sync drain."""
+    with SYNC_DIRTY_LOCK:
+        for t in tables:
+            if t in SYNC_DIRTY:
+                SYNC_DIRTY[t] = True
+
+def _consume_dirty():
+    """Atomically reads and clears all dirty flags. Returns the snapshot."""
+    with SYNC_DIRTY_LOCK:
+        snap = {k: v for k, v in SYNC_DIRTY.items()}
+        for k in SYNC_DIRTY:
+            SYNC_DIRTY[k] = False
+        return snap
+
 
 # Tracks user interaction cooldowns (Rate limiting)
 button_cooldowns = {}
@@ -478,6 +500,7 @@ def _set_config(key, value):
                 conn.commit()
                 # Update cache
                 CONFIG_MEM_CACHE[key] = (str(value), time.time() + CONFIG_CACHE_TTL)
+        _mark_dirty('config')
         return True
     except Exception as e:
         print(f"Error in _set_config ({key}): {e}")
@@ -1031,6 +1054,7 @@ def _save_team(data: dict):
                     created_at
                 ))
                 conn.commit()
+        _mark_dirty('teams')
     except Exception as e:
         print(f"❌ Error in _save_team: {e}")
 
@@ -1070,7 +1094,7 @@ def _log_registration(team_data: dict, tagged_ids: list, player_tags: list, lobb
                     lobby_name, lobby_name
                 ))
                 conn.commit()
-        pass # Log removed for production
+        _mark_dirty('logs')
     except Exception as e:
         print(f"Error in _log_registration: {e}")
 
@@ -1089,6 +1113,7 @@ def _update_log_lobby(user_id: str, lobby_name: str):
                 if row:
                     conn.execute("UPDATE registration_log SET lobby_protection = ? WHERE rowid = ?", (lobby_name, row['rowid']))
                     conn.commit()
+                    _mark_dirty('logs')
                     return True
     except Exception as e:
         print(f"Error in _update_log_lobby: {e}")
@@ -1128,6 +1153,7 @@ def _clear_log_protection_by_player(player_id: str):
                     conn.execute("DELETE FROM registration_log WHERE rowid = ?", (row['rowid'],))
                 if results:
                     conn.commit()
+                    _mark_dirty('logs')
                 return results
     except Exception as e:
         print(f"Error in _clear_log_protection_by_player: {e}")
@@ -1222,6 +1248,7 @@ def _clear_lobby_assignments(lobby_name: str):
         with _get_db_conn() as conn:
             conn.execute("UPDATE teams SET lobby = '' WHERE lobby = ?", (lobby_name,))
             conn.commit()
+            _mark_dirty('teams')
 
 
 @db_retry()
@@ -1232,7 +1259,7 @@ def _delete_log_by_lobby(lobby_name: str):
             with _get_db_conn() as conn:
                 result = conn.execute("DELETE FROM registration_log WHERE lobby_protection = ?", (lobby_name,))
                 conn.commit()
-                pass # Log removed for production
+                _mark_dirty('logs')
     except Exception as e:
         print(f"Error in _delete_log_by_lobby: {e}")
 
@@ -1244,6 +1271,7 @@ def _delete_all_logs():
             with _get_db_conn() as conn:
                 conn.execute("DELETE FROM registration_log")
                 conn.commit()
+                _mark_dirty('logs')
     except Exception as e:
         print(f"Error in _delete_all_logs: {e}")
 
@@ -1261,7 +1289,7 @@ def _reset_all_locks_internal():
                 # 2. Delete all entries from registration_log (temporary protection only)
                 conn.execute("DELETE FROM registration_log")
                 conn.commit()
-                pass # Log removed for production
+                _mark_dirty('teams', 'logs')
                 return True
     except Exception as e:
         print(f"Error in _reset_all_locks_internal: {e}")
@@ -1346,6 +1374,7 @@ def _update_team_lobby(user_id: str, lobby_name: str, tagged_ids: str = None, ta
                 params.append(str(user_id))
                 conn.execute(sql, params)
                 conn.commit()
+        _mark_dirty('teams')
         return True
     except Exception as e:
         print(f"Error in _update_team_lobby: {e}")
@@ -1390,7 +1419,7 @@ def _soft_delete_team(user_id: str):
                 # 3. Hard delete from teams
                 conn.execute("DELETE FROM teams WHERE discord_id = ?", (str(user_id),))
                 conn.commit()
-                pass # Log removed for production
+                _mark_dirty('teams', 'deleted')
             return True
     except Exception as e:
         print(f"Error in _soft_delete_team: {e}")
@@ -1484,6 +1513,7 @@ def _add_ban(user_id, unban_timestamp, reason='', banned_by='', team_name='', ow
                     (str(user_id), float(unban_timestamp), str(reason), str(banned_by), str(team_name), str(owner_name), str(players), str(lobby_no), str(slot_no))
                 )
                 conn.commit()
+        _mark_dirty('bans')
     except Exception as e:
         pass
 
@@ -1523,6 +1553,7 @@ def _remove_ban(user_id):
             with _get_db_conn() as conn:
                 conn.execute("DELETE FROM bans WHERE user_id = ?", (str(user_id),))
                 conn.commit()
+                _mark_dirty('bans')
                 return True
     except Exception as e:
         pass
@@ -3278,8 +3309,8 @@ class MyBot(commands.Bot):
         # 1. Start Background Tasks (Unified)
         if not check_expiring_bans.is_running():
             check_expiring_bans.start()
-        if not mirror_to_sheets.is_running():
-            mirror_to_sheets.start()
+        if not drain_dirty_sync.is_running():
+            drain_dirty_sync.start()
         if not registration_timeout_task.is_running():
             registration_timeout_task.start()
 
@@ -4765,121 +4796,162 @@ async def before_check_expiring_bans():
 
 # ─── MIRRORING ENGINE ────────────────────────────────────────────────────────
 
-# 🟢 BLOCK 5: MIRRORING ENGINE (Google Sheets Sync) 🟢
-@tasks.loop(minutes=5.0)
+# 🟢 BLOCK 5: SMART-SYNC ENGINE (Google Sheets — only on actual SQL changes) 🟢
+#
+# Architecture:
+#   - DB writers flip per-table flags via _mark_dirty(...).
+#   - drain_dirty_sync (15s) pushes only flagged tables — zero traffic when idle.
+#   - mirror_to_sheets() is kept as a manual full push for !sync_now.
+
+async def _sheet_retry(func, *args, max_retries=4, **kwargs):
+    """Runs a blocking gspread call in a thread; retries on 429 with exponential backoff."""
+    loop = asyncio.get_event_loop()
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status == 429:
+                wait = 2 ** attempt
+                print(f"⚠️ Sheets 429: retrying in {wait}s ({attempt+1}/{max_retries})")
+                await asyncio.sleep(wait)
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err
+
+async def _replace_sheet(ws, headers, rows, chunk_size=300):
+    """Clears worksheet then writes headers + rows. Always writes the header row,
+    even when rows is empty — fixes the stale-rows bug when a table is cleared."""
+    if ws is None:
+        return
+    await _sheet_retry(ws.clear)
+    await _sheet_retry(ws.update, range_name='A1', values=[headers])
+    if not rows:
+        return
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i:i + chunk_size]
+        await _sheet_retry(ws.update, range_name=f'A{i+2}', values=chunk)
+        await asyncio.sleep(1)  # Breathe for API quota & heartbeat
+
+# ── PER-TABLE PREP HELPERS ───────────────────────────────────────────────────
+def _prep_teams_rows(teams):
+    rows = []
+    for t in teams:
+        def _s(v): return f"'{v}" if str(v).startswith('=') else str(v)
+        c_at = str(t.get('created_at', ''))
+        if c_at.replace('.', '').isdigit() and '.' in c_at:
+            try:
+                c_at = datetime.datetime.fromtimestamp(float(c_at)).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception: pass
+        rows.append([
+            _s(c_at), _s(t['creator_id']), _s(t['team_name']),
+            _s(t['owner_name']), _s(t['owner_email']), _s(t['contact_number']),
+            _s(t['player1']), _s(t['player2']), _s(t['player3']), _s(t['player4']),
+            _s(t['sub1']), _s(t['sub2']), _s(t['insta_handles']), _s(t['lobby']),
+            _s(t.get('tagged_names', '')), _s(t['tagged_ids']), _s(t['p1_tag']),
+            _s(t['p2_tag']), _s(t['p3_tag']), _s(t['p4_tag'])
+        ])
+    return rows
+
+def _prep_logs_rows(logs):
+    return [[f"'{l['discord_id']}", l['team_name'], l['p1_ign'], l['p2_ign'], l['p3_ign'], l['p4_ign'],
+             l['p1_tag'], l['p2_tag'], l['p3_tag'], l['p4_tag'], l['lobby_assigned'], l['lobby_protection']] for l in logs]
+
+def _prep_bans_rows(bans):
+    rows = []
+    for b in bans:
+        unban_ts = b['unban_timestamp']
+        try:
+            unban_str = datetime.datetime.fromtimestamp(float(unban_ts)).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            unban_str = str(unban_ts)
+        rows.append([b['user_id'], unban_str])
+    return rows
+
+def _prep_deleted_rows(del_teams):
+    return [[dt['discord_id'], dt['team_name'], dt['owner_name'], dt['owner_email'], dt['contact'],
+             dt['player1'], dt['player2'], dt['player3'], dt['player4'], dt['sub1'], dt['sub2'],
+             dt['ig_handles'], dt['lobby'], dt['tagged_ids'], dt['p1_tag'], dt['p2_tag'],
+             dt['p3_tag'], dt['p4_tag'], dt.get('deleted_at', '')] for dt in del_teams]
+
+def _read_config_rows():
+    with _get_db_conn() as conn:
+        return [[r['key'], r['value']] for r in conn.execute("SELECT key, value FROM config").fetchall()]
+
+async def _push_table(name):
+    """Pushes a single table. On failure, re-flags the table for the next drain."""
+    loop = asyncio.get_event_loop()
+    try:
+        if name == 'teams' and teams_ws is not None:
+            data = await loop.run_in_executor(None, _get_all_teams)
+            await _replace_sheet(teams_ws, TEAMS_HEADERS, await loop.run_in_executor(None, _prep_teams_rows, data))
+        elif name == 'logs' and log_ws is not None:
+            data = await loop.run_in_executor(None, _get_all_logs)
+            await _replace_sheet(log_ws, LOG_HEADERS, await loop.run_in_executor(None, _prep_logs_rows, data))
+        elif name == 'bans' and bans_ws is not None:
+            data = await loop.run_in_executor(None, _get_all_bans)
+            await _replace_sheet(bans_ws, BANS_HEADERS, await loop.run_in_executor(None, _prep_bans_rows, data))
+        elif name == 'deleted' and deleted_teams_ws is not None:
+            data = await loop.run_in_executor(None, _get_all_deleted_teams)
+            await _replace_sheet(deleted_teams_ws, DELETED_TEAMS_HEADERS, await loop.run_in_executor(None, _prep_deleted_rows, data))
+        elif name == 'config' and config_ws is not None:
+            await _replace_sheet(config_ws, CONFIG_HEADERS, await loop.run_in_executor(None, _read_config_rows))
+        else:
+            return False
+        return True
+    except Exception as e:
+        _mark_dirty(name)
+        print(f"❌ Push '{name}' failed: {e}")
+        return False
+
+# ── 15-SECOND DRAINER (the only auto-sync) ───────────────────────────────────
+@tasks.loop(seconds=15.0)
+async def drain_dirty_sync():
+    """Pushes only the tables flagged dirty since the last drain.
+    When nothing has changed in SQL, ZERO Sheets API calls are made."""
+    global _drain_running
+    if _drain_running:
+        return
+    if not all([teams_ws, log_ws, bans_ws, config_ws]):
+        return  # Sheets not ready yet
+    snap = _consume_dirty()
+    pending = [t for t, dirty in snap.items() if dirty]
+    if not pending:
+        return  # Nothing changed → nothing to push
+    _drain_running = True
+    try:
+        for t in pending:
+            await _push_table(t)
+            await asyncio.sleep(0.5)  # Inter-table breather
+    finally:
+        _drain_running = False
+
+@drain_dirty_sync.before_loop
+async def before_drain_dirty_sync():
+    await bot.wait_until_ready()
+
+# ── MANUAL FULL PUSH (used only by !sync_now) ────────────────────────────────
 async def mirror_to_sheets():
-    """Stabilized Mirroring: Interleaved updates to prevent heartbeat blocking."""
+    """Pushes every table to Sheets right now. Invoked manually by !sync_now."""
     global is_mirroring
-    if is_mirroring: return
+    if is_mirroring:
+        return
     is_mirroring = True
     try:
         if not all([teams_ws, log_ws, bans_ws, config_ws]):
-            pass # Log removed for production
+            print("⚠️ Manual push skipped: Sheets not ready.")
             return
-
-        loop = asyncio.get_event_loop()
-        
-        # 1. Teams Sync
-        teams = await loop.run_in_executor(None, _get_all_teams)
-        if teams and teams_ws:
-            def _prep_teams():
-                rows = []
-                for t in teams:
-                    def _s(v): return f"'{v}" if str(v).startswith('=') else str(v)
-                    
-                    # 🟢 Formatting: If created_at is a raw Unix float string, convert to readable date for Sheets
-                    c_at = str(t.get('created_at', ''))
-                    if c_at.replace('.', '').isdigit() and '.' in c_at:
-                        try:
-                            c_at = datetime.datetime.fromtimestamp(float(c_at)).strftime('%Y-%m-%d %H:%M:%S')
-                        except: pass
-
-                    rows.append([
-                        _s(c_at), _s(t['creator_id']), _s(t['team_name']), 
-                        _s(t['owner_name']), _s(t['owner_email']), _s(t['contact_number']), 
-                        _s(t['player1']), _s(t['player2']), _s(t['player3']), _s(t['player4']), 
-                        _s(t['sub1']), _s(t['sub2']), _s(t['insta_handles']), _s(t['lobby']), 
-                        _s(t.get('tagged_names', '')), _s(t['tagged_ids']), _s(t['p1_tag']), 
-                        _s(t['p2_tag']), _s(t['p3_tag']), _s(t['p4_tag'])
-                    ])
-                return rows
-            
-            rows = await loop.run_in_executor(None, _prep_teams)
-            await loop.run_in_executor(None, teams_ws.clear)
-            if rows:
-                await loop.run_in_executor(None, functools.partial(teams_ws.update, range_name='A1', values=[TEAMS_HEADERS]))
-                # 🟢 CHUNKED UPLOAD: Send 300 rows at a time to prevent "Payload Too Large" errors
-                for i in range(0, len(rows), 300):
-                    chunk = rows[i:i + 300]
-                    await loop.run_in_executor(None, functools.partial(teams_ws.update, range_name=f'A{i+2}', values=chunk))
-                    await asyncio.sleep(1) # Breathe for API quota
-
-        await asyncio.sleep(1) # Breathe for heartbeat
-
-        # 2. Registration Log Sync
-        logs = await loop.run_in_executor(None, _get_all_logs)
-        if logs and log_ws:
-            def _prep_logs():
-                return [[f"'{l['discord_id']}", l['team_name'], l['p1_ign'], l['p2_ign'], l['p3_ign'], l['p4_ign'], l['p1_tag'], l['p2_tag'], l['p3_tag'], l['p4_tag'], l['lobby_assigned'], l['lobby_protection']] for l in logs]
-            rows = await loop.run_in_executor(None, _prep_logs)
-            await loop.run_in_executor(None, log_ws.clear)
-            if rows:
-                await loop.run_in_executor(None, functools.partial(log_ws.update, range_name='A1', values=[LOG_HEADERS]))
-                # 🟢 CHUNKED UPLOAD for Logs
-                for i in range(0, len(rows), 300):
-                    chunk = rows[i:i + 300]
-                    await loop.run_in_executor(None, functools.partial(log_ws.update, range_name=f'A{i+2}', values=chunk))
-                    await asyncio.sleep(1)
-
-        await asyncio.sleep(1) # Breathe
-
-        # 3. Bans Sync
-        bans = await loop.run_in_executor(None, _get_all_bans)
-        if bans and bans_ws:
-            rows = []
-            for b in bans:
-                unban_ts = b['unban_timestamp']
-                try:
-                    unban_str = datetime.datetime.fromtimestamp(float(unban_ts)).strftime('%Y-%m-%d %H:%M:%S')
-                except:
-                    unban_str = str(unban_ts)
-                rows.append([b['user_id'], unban_str])
-            await loop.run_in_executor(None, bans_ws.clear)
-            if rows: await loop.run_in_executor(None, functools.partial(bans_ws.update, range_name='A1', values=[BANS_HEADERS]))
-            if rows: await loop.run_in_executor(None, functools.partial(bans_ws.update, range_name='A2', values=rows))
-
-        await asyncio.sleep(1) # Breathe
-
-        # 4. Deleted Teams & Config Sync
-        del_teams = await loop.run_in_executor(None, _get_all_deleted_teams)
-        if del_teams and deleted_teams_ws:
-            def _prep_del():
-                return [[dt['discord_id'], dt['team_name'], dt['owner_name'], dt['owner_email'], dt['contact'], dt['player1'], dt['player2'], dt['player3'], dt['player4'], dt['sub1'], dt['sub2'], dt['ig_handles'], dt['lobby'], dt['tagged_ids'], dt['p1_tag'], dt['p2_tag'], dt['p3_tag'], dt['p4_tag'], dt.get('deleted_at', '')] for dt in del_teams]
-            rows = await loop.run_in_executor(None, _prep_del)
-            await loop.run_in_executor(None, deleted_teams_ws.clear)
-            await loop.run_in_executor(None, functools.partial(deleted_teams_ws.update, range_name='A1', values=[DELETED_TEAMS_HEADERS]))
-            if rows: await loop.run_in_executor(None, functools.partial(deleted_teams_ws.update, range_name='A2', values=rows))
-
-        # Config Sync
-        def _get_cfg():
-            with _get_db_conn() as conn: return conn.execute("SELECT key, value FROM config").fetchall()
-        cfg_rows = await loop.run_in_executor(None, _get_cfg)
-        if cfg_rows and config_ws:
-            rows = [[r['key'], r['value']] for r in cfg_rows]
-            await loop.run_in_executor(None, config_ws.clear)
-            await loop.run_in_executor(None, functools.partial(config_ws.update, range_name='A1', values=[CONFIG_HEADERS]))
-            await loop.run_in_executor(None, functools.partial(config_ws.update, range_name='A2', values=rows))
-
-        # Mirroring Cycle Complete. (Silent)
+        for t in ('teams', 'logs', 'bans', 'deleted', 'config'):
+            await _push_table(t)
+            await asyncio.sleep(1)
+        _consume_dirty()
     except Exception as e:
-        print(f"❌ Mirroring Error: {e}")
+        print(f"❌ Manual push error: {e}")
     finally:
         is_mirroring = False
-
-
-@mirror_to_sheets.before_loop
-async def before_mirror_to_sheets():
-    await bot.wait_until_ready()
 
 # ─── ADMIN COMMANDS ──────────────────────────────────────────────────────────
 @bot.command(name='ac')
